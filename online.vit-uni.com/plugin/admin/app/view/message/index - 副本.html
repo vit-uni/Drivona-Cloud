@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ko">
+    <head>
+        <meta charset="utf-8">
+        <title>조회 페이지</title>
+        <link rel="stylesheet" href="/app/admin/component/pear/css/pear.css" />
+        <link rel="stylesheet" href="/app/admin/admin/css/reset.css" />
+    </head>
+    <body class="pear-container">
+    
+
+        
+        <!-- 데이터 테이블 -->
+        <div class="layui-card">
+            <div class="layui-card-body">
+                <table id="data-table" lay-filter="data-table"></table>
+            </div>
+        </div>
+
+        <!-- 테이블 상단 툴바 -->
+        <script type="text/html" id="table-toolbar">
+            <button class="pear-btn pear-btn-primary pear-btn-md" lay-event="add" permission="app.admin.message.insert">
+                <i class="layui-icon layui-icon-add-1"></i>추가
+            </button>
+            <button class="pear-btn pear-btn-danger pear-btn-md" lay-event="batchRemove" permission="app.message.user.delete">
+                <i class="layui-icon layui-icon-delete"></i>삭제
+            </button>
+        </script>
+
+        <!-- 테이블 행 툴바 -->
+        <script type="text/html" id="table-bar">
+            <button class="pear-btn pear-btn-xs tool-btn" lay-event="edit" permission="app.message.user.update">편집</button>
+            <button class="pear-btn pear-btn-xs tool-btn" lay-event="remove" permission="app.message.user.delete">삭제</button>
+        </script>
+
+        <script src="/app/admin/component/layui/layui.js?v=2.8.12"></script>
+        <script src="/app/admin/component/pear/pear.js"></script>
+        <script src="/app/admin/admin/js/permission.js"></script>
+        <script src="/app/admin/admin/js/common.js"></script>
+        <script>
+
+            // 관련 상수
+            const PRIMARY_KEY = "id";
+            const SELECT_API = "/app/admin/message/select";
+            const UPDATE_API = "/app/admin/message/update";
+            const DELETE_API = "/app/admin/message/delete";
+            const INSERT_URL = "/app/admin/message/insert";
+
+
+          
+            // 테이블 렌더링
+            layui.use(["table", "form", "common", "popup", "util"], function() {
+                let table = layui.table;
+                let form = layui.form;
+                let $ = layui.$;
+                let common = layui.common;
+                let util = layui.util;
+                
+                // 테이블 헤더 파라미터
+                let cols = [
+                    {
+                        type: "checkbox"
+                    },{
+                        title: "기본키",
+                        field: "id",
+                        sort: true,
+                    },{
+                        title: "정보",
+                        field: "message",
+                        
+                    },{
+                        title: "추가일",
+                        field: "created_at",
+                        
+                    },{
+                        title: "작업",
+                        toolbar: "#table-bar",
+                        align: "center",
+                        fixed: "right",
+                        width: 130,
+                    }
+                ];
+                
+                // 테이블 렌더링
+                function render()
+                {
+                    table.render({
+                        elem: "#data-table",
+                        url: SELECT_API,
+                        page: true,
+                        cols: [cols],
+                        skin: "line",
+                        size: "lg",
+                        toolbar: "#table-toolbar",
+                        autoSort: false,
+                        defaultToolbar: [{
+                            title: "새로고침",
+                            layEvent: "refresh",
+                            icon: "layui-icon-refresh",
+                        }, "filter", "print", "exports"],
+                        done: function () {
+                            layer.photos({photos: 'div[lay-id="data-table"]', anim: 5});
+                        }
+                    });
+                }
+                
+                // 테이블 내 드롭다운 또는 트리 컴포넌트 데이터 가져오기
+                let apis = [];
+                apis.push(["sex", "/app/admin/dict/get/sex"]);
+                let apiResults = {};
+                apiResults["sex"] = [];
+                let count = apis.length;
+                layui.each(apis, function (k, item) {
+                    let [field, url] = item;
+                    $.ajax({
+                        url: url,
+                        dateType: "json",
+                        success: function (res) {
+                            if (res.code) {
+                                return layui.popup.failure(res.msg);
+                            }
+                            function travel(items) {
+                                for (let k in items) {
+                                    let item = items[k];
+                                    apiResults[field][item.value] = item.name;
+                                    if (item.children) {
+                                        travel(item.children);
+                                    }
+                                }
+                            }
+                            travel(res.data);
+                        },
+                        complete: function () {
+                            if (--count === 0) {
+                                render();
+                            }
+                        }
+                    });
+                });
+                if (!count) {
+                    render();
+                }
+                
+                // 행 편집 또는 삭제 이벤트
+                table.on("tool(data-table)", function(obj) {
+                    if (obj.event === "remove") {
+                        remove(obj);
+                    } else if (obj.event === "edit") {
+                        edit(obj);
+                    }
+                });
+
+                // 테이블 상단 툴바 이벤트
+                table.on("toolbar(data-table)", function(obj) {
+                    if (obj.event === "add") {
+                        add();
+                    } else if (obj.event === "refresh") {
+                        refreshTable();
+                    } else if (obj.event === "batchRemove") {
+                        batchRemove(obj);
+                    }
+                });
+
+                // 테이블 상단 검색 이벤트
+                form.on("submit(table-query)", function(data) {
+                    table.reload("data-table", {
+                        page: {
+                            curr: 1
+                        },
+                        where: data.field
+                    })
+                    return false;
+                });
+                
+                // 테이블 상단 검색 초기화 이벤트
+                form.on("submit(table-reset)", function(data) {
+                    table.reload("data-table", {
+                        where: []
+                    })
+                });
+
+                // 테이블 정렬 이벤트
+                table.on("sort(data-table)", function(obj){
+                    table.reload("data-table", {
+                        initSort: obj,
+                        scrollPos: "fixed",
+                        where: {
+                            field: obj.field,
+                            order: obj.type
+                        }
+                    });
+                });
+
+                // 테이블 데이터 추가
+                let add = function() {
+                    layer.open({
+                        type: 2,
+                        title: "추가",
+                        shade: 0.1,
+                        area: [common.isModile()?"100%":"1080px", common.isModile()?"100%":"620px"],
+                        content: INSERT_URL
+                    });
+                }
+
+                // 테이블 데이터 편집
+                let edit = function(obj) {
+                    let value = obj.data[PRIMARY_KEY];
+                    layer.open({
+                        type: 2,
+                        title: "수정",
+                        shade: 0.1,
+                        area: [common.isModile()?"100%":"1080px", common.isModile()?"100%":"620px"],
+                        content: UPDATE_URL + "?" + PRIMARY_KEY + "=" + value
+                    });
+                }
+
+                // 한 행 삭제
+                let remove = function(obj) {
+                    return doRemove(obj.data[PRIMARY_KEY]);
+                }
+
+                // 여러 행 삭제
+                let batchRemove = function(obj) {
+                    let checkIds = common.checkField(obj, PRIMARY_KEY);
+                    if (checkIds === "") {
+                        layui.popup.warning("선택된 데이터가 없습니다");
+                        return false;
+                    }
+                    doRemove(checkIds.split(","));
+                }
+
+                // 삭제 실행
+                let doRemove = function (ids) {
+                    let data = {};
+                    data[PRIMARY_KEY] = ids;
+                    layer.confirm("삭제하시겠습니까?", {
+                        icon: 3,
+                        title: "안내"
+                    }, function(index) {
+                        layer.close(index);
+                        let loading = layer.load();
+                        $.ajax({
+                            url: DELETE_API,
+                            data: data,
+                            dataType: "json",
+                            type: "post",
+                            success: function(res) {
+                                layer.close(loading);
+                                if (res.code) {
+                                    return layui.popup.failure(res.msg);
+                                }
+                                return layui.popup.success("작업 성공", refreshTable);
+                            }
+                        })
+                    });
+                }
+
+                // 테이블 데이터 새로고침
+                window.refreshTable = function() {
+                    table.reloadData("data-table", {
+                        scrollPos: "fixed",
+                        done: function (res, curr) {
+                            if (curr > 1 && res.data && !res.data.length) {
+                                curr = curr - 1;
+                                table.reloadData("data-table", {
+                                    page: {
+                                        curr: curr
+                                    },
+                                })
+                            }
+                        }
+                    });
+                }
+            })
+
+        </script>
+    </body>
+</html>

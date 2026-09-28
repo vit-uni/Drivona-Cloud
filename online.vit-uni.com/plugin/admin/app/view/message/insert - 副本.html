@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <title>추가 페이지</title>
+        <link rel="stylesheet" href="/app/admin/component/pear/css/pear.css" />
+        <link rel="stylesheet" href="/app/admin/admin/css/reset.css" />
+    </head>
+    <body>
+
+        <form class="layui-form" action="">
+
+            <div class="mainBox">
+                <div class="main-container mr-5">
+                    
+                    <div class="layui-form-item">
+                        <label class="layui-form-label required">정보</label>
+                        <div class="layui-input-block">
+                            <input type="text" name="message" value="" required lay-verify="required" class="layui-input">
+                        </div>
+                    </div>
+                    
+                </div>
+            </div>
+
+            <div class="bottom">
+                <div class="button-container">
+                    <button type="submit" class="pear-btn pear-btn-primary pear-btn-md" lay-submit=""
+                        lay-filter="save">
+                        제출
+                    </button>
+                    <button type="reset" class="pear-btn pear-btn-md">
+                        초기화
+                    </button>
+                </div>
+            </div>
+            
+        </form>
+
+        <script src="/app/admin/component/layui/layui.js?v=2.8.12"></script>
+        <script src="/app/admin/component/pear/pear.js"></script>
+        <script src="/app/admin/admin/js/permission.js"></script>
+        <script>
+
+            // 관련 인터페이스
+            const INSERT_API = "/app/admin/message/insert";
+            
+            // 필드 성별 sex
+            layui.use(["jquery", "xmSelect"], function() {
+                layui.$.ajax({
+                    url: "/app/admin/dict/get/sex",
+                    dataType: "json",
+                    success: function (res) {
+                        let value = layui.$("#sex").attr("value");
+                        let initValue = value ? value.split(",") : [];
+                        layui.xmSelect.render({
+                            el: "#sex",
+                            name: "sex",
+                            initValue: initValue,
+                            data: res.data,
+                            value: "1",
+                            model: {"icon":"hidden","label":{"type":"text"}},
+                            clickClose: true,
+                            radio: true,
+                        });
+                        if (res.code) {
+                            layui.popup.failure(res.msg);
+                        }
+                    }
+                });
+            });
+            
+            // 필드 프로필 사진 avatar
+            layui.use(["upload", "layer"], function() {
+                let input = layui.$("#avatar").prev();
+                input.prev().attr("src", input.val());
+                layui.$("#attachment-choose-avatar").on("click", function() {
+                    parent.layer.open({
+                        type: 2,
+                        title: "첨부파일 선택",
+                        content: "/app/admin/upload/attachment?ext=jpg,jpeg,png,gif,bmp",
+                        area: ["95%", "90%"],
+                        success: function (layero, index) {
+                            parent.layui.$("#layui-layer" + index).data("callback", function (data) {
+                                input.val(data.url).prev().attr("src", data.url);
+                            });
+                        }
+                    });
+                });
+                layui.upload.render({
+                    elem: "#avatar",
+                    url: "/app/admin/upload/avatar",
+                    acceptMime: "image/gif,image/jpeg,image/jpg,image/png",
+                    field: "__file__",
+                    done: function (res) {
+                        if (res.code > 0) return layui.layer.msg(res.msg);
+                        this.item.prev().val(res.data.url).prev().attr("src", res.data.url);
+                    }
+                });
+            });
+            
+            // 필드 생일 birthday
+            layui.use(["laydate"], function() {
+                layui.laydate.render({
+                    elem: "#birthday",
+                });
+            })
+            
+            // 필드 로그인 시간 last_time
+            layui.use(["laydate"], function() {
+                layui.laydate.render({
+                    elem: "#last_time",
+                    type: "datetime",
+                });
+            })
+            
+            // 필드 가입 시간 join_time
+            layui.use(["laydate"], function() {
+                layui.laydate.render({
+                    elem: "#join_time",
+                    type: "datetime",
+                });
+            })
+            
+            // 필드 비활성화 status
+            layui.use(["form"], function() {
+                layui.$("#status").attr("checked", layui.$('input[name="status"]').val() != 0);
+                layui.form.render();
+                layui.form.on("switch(status)", function(data) {
+                    layui.$('input[name="status"]').val(this.checked ? 1 : 0);
+                });
+            })
+            
+            // 제출 이벤트
+            layui.use(["form", "popup"], function () {
+                layui.form.on("submit(save)", function (data) {
+                    layui.$.ajax({
+                        url: INSERT_API,
+                        type: "POST",
+                        dateType: "json",
+                        data: data.field,
+                        success: function (res) {
+                            if (res.code) {
+                                return layui.popup.failure(res.msg);
+                            }
+                            return layui.popup.success("작업 성공", function () {
+                                parent.refreshTable();
+                                parent.layer.close(parent.layer.getFrameIndex(window.name));
+                            });
+                        }
+                    });
+                    return false;
+                });
+            });
+
+        </script>
+
+    </body>
+</html>

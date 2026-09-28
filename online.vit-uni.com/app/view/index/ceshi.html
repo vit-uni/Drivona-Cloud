@@ -1,0 +1,83 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>诗句推送</title>
+    <style>
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        #poem-container,#poem-container2 {
+            background-color: white;
+            border-radius: 5px;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            min-height: 200px;
+        }
+        .poem-line {
+            margin-bottom: 10px;
+            font-size: 18px;
+            line-height: 1.6;
+            color: #333;
+        }
+        .timestamp {
+            color: #999;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>解析：</h1>
+    <div id="poem-container"></div>
+    <h1>结论：</h1>
+    <div id="poem-container2"></div>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const poemContainer = document.getElementById('poem-container');
+            const poemContainer2 = document.getElementById('poem-container2');
+            // 创建 SSE 连接
+            //const eventSource = new EventSource('http://122.114.237.95:9002');
+            const eventSource = new EventSource('http://122.114.237.95:9002?talk_id=6&message=现在是北京时间几点&filetype=1');
+            
+            // 监听消息事件
+            eventSource.addEventListener('message', function(event) {
+                
+                console.log(event.data);
+                const data = JSON.parse(event.data);
+                const lineElement = document.createElement('span');
+                if(data.choices[0]['finish_reason']===null){
+                    if(data.choices[0]['delta']['reasoning_content']){
+                        lineElement.innerHTML = data.choices[0]['delta']['reasoning_content'];
+                        poemContainer.appendChild(lineElement);
+                    }else if(data.choices[0]['delta']['content']){
+                        lineElement.innerHTML = data.choices[0]['delta']['content'];
+                        poemContainer2.appendChild(lineElement);
+                    }
+                }
+            });
+            
+            // 监听错误事件
+            // eventSource.addEventListener('error', function(event) {
+            //     console.error('SSE 连接错误:', event);
+            //     eventSource.close();
+                
+            //     // 尝试重新连接
+            //     setTimeout(function() {
+            //         location.reload();
+            //     }, 5000);
+            // });
+        });
+    </script>
+</body>
+</html>
