@@ -4,14 +4,14 @@ return  [
     'connections' => [
         'mysql' => [
             'driver'      => 'mysql',
-            'host'        => '127.0.0.1',
+            'host'        => '47.87.135.97',
             'port'        => '3306',
             // 数据库名
-            'database' => 'online',
+            'database' => 'velapp_veloqor',
             // 数据库用户名
-            'username' => 'online',
+            'username' => 'velapp_veloqor',
             // 数据库密码
-            'password' => 'BjjkNJKmKpdmpfYc',
+            'password' => '3bx5Hxk7CKC9nEfm',
             'charset'     => 'utf8mb4',
             'collation'   => 'utf8mb4_general_ci',
             'prefix'      => '',

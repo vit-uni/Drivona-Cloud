@@ -7,13 +7,13 @@ return [
             // 数据库类型
             'type' => 'mysql',
             // 服务器地址
-            'hostname' => '127.0.0.1',
+            'hostname' => '47.87.135.97',
             // 数据库名
-            'database' => 'online',
+            'database' => 'velapp_veloqor',
             // 数据库用户名
-            'username' => 'online',
+            'username' => 'velapp_veloqor',
             // 数据库密码
-            'password' => 'BjjkNJKmKpdmpfYc',
+            'password' => '3bx5Hxk7CKC9nEfm',
             // 数据库连接端口
             'hostport' => 3306,
             // 数据库连接参数

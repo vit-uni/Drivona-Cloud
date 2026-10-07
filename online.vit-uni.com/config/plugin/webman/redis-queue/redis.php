@@ -1,10 +1,10 @@
 <?php
 return [
     'default' => [
-        'host' => 'redis://127.0.0.1:6379',
+        'host' => 'redis://47.87.135.97:6379',
         'options' => [
             'auth' => '5623fdsg',
-            'db' => 0,
+            'db' => 1,
             'prefix' => '',
             'max_attempts'  => 5,
             'retry_seconds' => 5,
