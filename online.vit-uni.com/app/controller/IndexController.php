@@ -218,6 +218,10 @@ class IndexController
         $inc['password'] = Util::passwordHash($password);
         $inc['status'] = 1;
         $inc['created_at'] = date('Y-m-d H:i:s');
+        $inc['join_ip'] = $request->getRealIp();
+        $inc['join_time'] = $inc['created_at'];
+        $inc['last_ip'] = $inc['join_ip'];   // 需求4：最后一次登录 ip = 注册 ip
+        $inc['last_time'] = $inc['created_at'];
         $res = Db::name('users')->insert($inc);
         if($res)return json(['code' => 1, 'msg' => self::t($request, '注册成功')]);
         return json(['code' => 0, 'msg' => self::t($request, '注册失败')]);
@@ -282,6 +286,8 @@ class IndexController
 
         $token = random('unique');
         $older['token'] = $token;
+        $older['last_ip'] = $request->getRealIp();
+        $older['last_time'] = date('Y-m-d H:i:s');
         Db::name('users')->update($older);
         return json(['code' => 1, 'msg' => self::t($request, '登陆成功'),'data'=>$token]);
     }
