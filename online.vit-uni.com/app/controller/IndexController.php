@@ -388,8 +388,8 @@ class IndexController
         $uuid  = $request->input('uuid');
         $up = [];
         $up['uuid'] = $uuid;
-        $log = Db::name('equipment')->where($up)->find();
-        if($log)return json(['code' => 0, 'msg' => self::t($request, '设备已被其他用户绑定，解绑后在使用')]);
+//        $log = Db::name('equipment')->where($up)->find();
+//        if($log)return json(['code' => 0, 'msg' => self::t($request, '设备已被其他用户绑定，解绑后在使用')]);
         return json(['code' => 1, 'msg' => self::t($request, '新设备')]);
     }
     //绑定设备
@@ -399,17 +399,19 @@ class IndexController
         $user = $request->input('user_info');
         $up = [];
         $up['uuid'] = $uuid;
+        $up['user_id'] = $user['id'];
         $log = Db::name('equipment')->where($up)->find();
-        
+
         if(!$log){
-            $up['user_id'] = $user['id'];
+
             $up['title'] = $title;
             $up['createtime'] = time();
             Db::name('equipment')->insert($up);
             return json(['code' => 1, 'msg' => self::t($request, '添加成功')]);
         }
-        return json(['code' => 0, 'msg' => self::t($request, '设备已被其他用户绑定，解绑后在使用')]);
-       
+//        return json(['code' => 0, 'msg' => self::t($request, '设备已被其他用户绑定，解绑后在使用')]);
+        return json(['code' => 0, 'msg' => self::t($request, '添加成功')]);
+
     }
     
      public function equipment_del(Request $request){
