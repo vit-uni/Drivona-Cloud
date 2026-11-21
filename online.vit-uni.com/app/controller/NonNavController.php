@@ -37,7 +37,7 @@ class NonNavController
     // ======================= 可调参数（按实际效果调整） =======================
 
     /** 搜索半径（米）。非导航只取最近摄像头做 BLE 预警，10km 已足够，候选量大减、查询更快 */
-    private const MAX_DISTANCE = 3000;
+    private const MAX_DISTANCE = 2000;
 
     /**
      * 前方扇区：摄像头方位角与行驶方向夹角上限（度）；90° 即前半平面。
@@ -51,13 +51,6 @@ class NonNavController
 
     /** dirtype 方向匹配容差（度），与 Location::DIR_MATCH_ANGLE 一致 */
     private const DIR_MATCH_ANGLE = 30;
-
-    /**
-     * 近场放宽距离（米）：预警区(≤该值)内、前方且贴车道的摄像头跳过严格方向匹配，
-     * 抵消 GPS heading 抖动（静止/低速时 180° 翻转）导致的 App show/hide 闪烁。
-     * 设为 0 可关闭放宽、回到全程严格方向匹配。
-     */
-    private const NEAR_FIELD_DISTANCE = 1500;
 
     /** 横向走廊最小宽度（米），近距离用于抑制相邻/并行道路 */
     private const CORRIDOR_BASE = 30;
@@ -75,6 +68,30 @@ class NonNavController
 
     /** 横向走廊宽度上限（米），避免远距离放得过宽 */
     private const CORRIDOR_MAX = 800;
+
+    /**
+     * devices 专用放宽横向走廊参数（仅 $relaxNearField=true 时生效，events 不受影响）。
+     *
+     * 背景：日志分析发现原 CORRIDOR_SLOPE=0.20（≈11.3° 半角）+ CORRIDOR_BASE=30 下存在两类闪烁：
+     *
+     *   Situation 1（间歇性无数据）：摄像头横向偏移（cross-track）在走廊边缘时，车辆沿同一方向
+     *   行驶接近导致走廊线性收窄（distance × 0.20），cross-track 基本不变而走廊持续变窄，
+     *   摄像头从「刚好通过」翻转为「刚好不通过」，连续多次返回空列表后又恢复——
+     *   实测 cam-121674 在 2030m 处 corridor=406m（cross-track=393m，通过），车辆前进 90m
+     *   到 1937m 处 corridor=387m（cross-track=393m，不通过），连续 5 次无数据。
+     *
+     *   Situation 2（首位摄像头 ID 跳变）：方向角仅变化 3~4° 时，cross-track 随之偏移数十米，
+     *   加之走廊随距离收窄，摄像头在「通过/不通过」之间翻转，首位 ID 在不同摄像头间跳变——
+     *   实测方向角 28.29°→24.93°（仅 3.36°），cam-121693 的 cross-track 从 101m 升至 150m，
+     *   corridor 从 160m 降至 145m，从通过翻转为不通过，首位 ID 从 121693 跳变为 121685。
+     *
+     * 放宽到 SLOPE=0.30（≈17.5° 半角）+ BASE=100m 后：
+     *   - 2000m 处走廊 600m（原 400m），cross-track ~400m 的摄像头稳定通过
+     *   - 近距离 base 100m（原 30m），防止近场摄像头因微小横向偏移被剔除
+     *   - 仍能有效抑制真正偏离行驶方向的相邻/并行道路摄像头（17.5° 半角仍在合理范围）
+     */
+    private const CORRIDOR_BASE_RELAXED = 100;
+    private const CORRIDOR_SLOPE_RELAXED = 0.30;
 
     /** SQL 侧候选上限（已按距离排序，取最近的 N 条，防止密集区域拉取过多行） */
     private const SQL_SAFETY_LIMIT = 1000;
@@ -193,18 +210,14 @@ class NonNavController
     /**
      * 获取非导航模式下的前方事件列表
      *
-     * 复用 devices 的「方向 + 前方扇区 + 横向走廊」匹配逻辑，但事件关闭了
-     * devices 的「近场方向放宽」：导航 events 始终校验 direction/dirtype，
-     * 非导航也只有保持严格方向匹配，才能让同一条道路上开关导航得到的事件大致相同。
+     * 查询与过滤逻辑与 devices 完全一致（同一套「方向 + 前方扇区 + 横向走廊」）：
+     *   - 查询：边界框粗筛 + ST_Distance_Sphere 距离计算/排序 + LIMIT，距离上限在 PHP 侧统一裁剪；
+     *   - 过滤：调用同一个 filterAhead，方向始终按 dirtype/direction 校验（事件方向 vs 行驶方向），
+     *     并使用与 devices 相同的放宽横向走廊，保证同一位置的摄像头与事件过滤口径一致。
+     * 唯一差异是数据表不同（device_event vs device），directiontype 别名映射为 dirtype。
      *
      * 与导航 events 的差异仅在于：非导航没有真实道路折线，route 只是一组
      * 扇形点，不能用于路线缓冲区匹配，因此这里仅兼容接收、不参与几何计算。
-     *
-     * 查询优化（不涉及表结构变更）：
-     *   1. 经纬度边界框走 idx_lng_lat 复合索引，只扫描附近行；
-     *   2. ST_Distance_Sphere 只在 SELECT 中计算一次，用 HAVING 引用该别名做距离过滤，
-     *      避免在 WHERE 中重复计算球面距离（原导航 events 的实现会算两遍）；
-     *   3. SQL 按距离升序 LIMIT，保证最近的事件一定在候选集内，PHP 只处理有限行。
      *
      * 接口：GET/POST /nonNav/events
      * 参数：lat、long、direction（行驶方向角）、route（可选，非导航扇形点，仅兼容接收不参与匹配）
@@ -239,8 +252,9 @@ class NonNavController
         $latRadius       = $boxDistance / $metersPerDegLat;
         $lngRadius       = $boxDistance / max($metersPerDegLng, 0.001);
 
-        // 4. 查询：边界框粗筛 + 距离计算/排序在 SQL 完成，取最近 SQL_SAFETY_LIMIT 条。
-        //    directiontype 与摄像头 dirtype 语义一致（0=单向，1=双向），这里统一别名，
+        // 4. 查询：与 devices 结构一致 —— 边界框粗筛 + 距离计算/排序都在 SQL 完成，
+        //    取最近 SQL_SAFETY_LIMIT 条；距离上限由 PHP 侧 filterAhead 统一裁剪。
+        //    directiontype 与摄像头 dirtype 语义一致（0=单向，1=双向，2=全向），统一别名，
         //    以便直接复用与 devices 相同的 filterAhead 过滤逻辑。
         $queryStart = microtime(true);
         $list = Db::name('device_event')
@@ -248,20 +262,17 @@ class NonNavController
                      ST_Distance_Sphere(point({$long}, {$lat}), point(longitude, latitude)) AS distance")
             ->where("longitude BETWEEN ? AND ?", [$long - $lngRadius, $long + $lngRadius])
             ->where("latitude BETWEEN ? AND ?", [$lat - $latRadius, $lat + $latRadius])
-            // distance 是 SELECT 中的别名，HAVING 可直接引用，球面距离只计算一次
-            ->having('distance < ' . (int) $maxDistance)
             ->order('distance ASC')
             ->limit(self::SQL_SAFETY_LIMIT)
             ->select();
         $queryMs = round((microtime(true) - $queryStart) * 1000, 2);
 
-        // 5. 方向 + 扇区 + 横向走廊过滤（与 devices 同一套逻辑）。
-        //    事件关闭近场方向放宽：导航 events 始终校验 direction/dirtype，
-        //    若这里放宽会让非导航在非正北方向多出大量导航不会返回的事件，
-        //    与"开关导航结果大致相同"的目标相悖，也容易对逆向事件误报。
+        // 5. 方向 + 扇区 + 横向走廊过滤（与 devices 完全一致，使用相同的放宽走廊参数）。
+        //    方向匹配始终校验：事件方向(direction/directiontype)需与车辆行驶方向(direction)兼容，
+        //    避免把对面车道/逆向的事件查出来。
         $vehicle     = ['lat' => $lat, 'lng' => $long, 'bearing' => $direction];
         $filterStart = microtime(true);
-        $data        = self::filterAhead($vehicle, $list, $maxDistance, false);
+        $data        = self::filterAhead($vehicle, $list, $maxDistance);
         $filterMs    = round((microtime(true) - $filterStart) * 1000, 2);
 
         $totalMs = round((microtime(true) - $start) * 1000, 2);
@@ -293,9 +304,9 @@ class NonNavController
      * @param array $vehicle  ['lat' => float, 'lng' => float, 'bearing' => float]
      * @param iterable $cameras 数据库候选集（think\Collection 或数组）
      * @param float $maxDistance 最大距离（米）
-     * @param bool $relaxNearField 近场内是否放宽方向匹配：
-     *        devices 传 true（抵消 GPS heading 抖动导致的 show/hide 闪烁）；
-     *        events 传 false（与导航 events 的严格方向匹配保持一致）
+     * @param bool $relaxNearField 是否使用放宽的横向走廊（仅影响走廊宽度，方向匹配始终生效）：
+     *        devices / events 均使用默认 true（走廊 Base 100m / Slope 0.30，防止临近道路抖动导致 show/hide 闪烁）；
+     *        传 false 时回退到严格走廊（Base 30m / Slope 0.20），当前无调用方使用
      * @return array 匹配结果，按 distance 升序
      */
     private static function filterAhead(array $vehicle, iterable $cameras, float $maxDistance, bool $relaxNearField = true): array
@@ -404,7 +415,7 @@ class NonNavController
      * @param float      $maxDistance   最大距离（米）
      * @param bool       $isAdditional  是否为附加坐标点
      * @param mixed      $additionalId  附加点自身 id（用于让 App 区分去重）
-     * @param bool       $relaxNearField 近场内是否放宽方向匹配（见 filterAhead）
+     * @param bool       $relaxNearField 是否使用放宽的横向走廊（见 filterAhead）
      * @return array|null 匹配成功返回结果行，否则 null
      */
     private static function matchPoint(
@@ -422,12 +433,10 @@ class NonNavController
         $additionalId = null,
         $relaxNearField = true
     ) {
-        // 1. 方向匹配：监控方向需与行驶方向兼容。
-        //    devices：预警区(≤NEAR_FIELD_DISTANCE)内放宽，抵消 GPS heading 抖动(180° 翻转)
-        //    导致的 App show/hide 闪烁；events：关闭放宽，与导航 events 的严格校验一致。
-        //    前方扇区与横向走廊在两种模式下始终生效。
-        if ((!$relaxNearField || $distance > self::NEAR_FIELD_DISTANCE)
-            && !self::matchesMonitoringDirection($vBearing, $pointDirection, $dirtype)) {
+        // 1. 方向匹配：监控方向需与行驶方向兼容（dirtype：0=当前车道单向，1=双向，2=全向）。
+        //    与 events / IndexController::devices 一致，始终校验，避免把对面车道(dirtype=0 反向)
+        //    摄像头误报；前方扇区与横向走廊在两种模式下始终生效。
+        if (!self::matchesMonitoringDirection($vBearing, $pointDirection, $dirtype)) {
             return null;
         }
 
@@ -445,9 +454,19 @@ class NonNavController
         }
 
         // 4. 横向走廊：抑制相邻/并行道路，随距离放宽以贴合缓弯
-        $crossTrack  = self::getCrossTrackDistance($distance, $geoBearing, $vBearing);
+        //    devices / events（$relaxNearField=true）均使用放宽走廊参数，防止走廊线性收窄导致
+        //    摄像头反复出现/消失（Situation 1）及小方向角变化导致首位 ID 跳变（Situation 2）。
+        //    $relaxNearField=false 时为严格走廊（Base 30m / Slope 0.20），当前无调用方使用。
+        $crossTrack = self::getCrossTrackDistance($distance, $geoBearing, $vBearing);
+        if ($relaxNearField) {
+            $corridorBase  = self::CORRIDOR_BASE_RELAXED;
+            $corridorSlope = self::CORRIDOR_SLOPE_RELAXED;
+        } else {
+            $corridorBase  = self::CORRIDOR_BASE;
+            $corridorSlope = self::CORRIDOR_SLOPE;
+        }
         $corridorCap = min(
-            max(self::CORRIDOR_BASE, $distance * self::CORRIDOR_SLOPE),
+            max($corridorBase, $distance * $corridorSlope),
             self::CORRIDOR_MAX
         );
         if ($crossTrack > $corridorCap) {
