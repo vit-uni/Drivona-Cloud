@@ -50,7 +50,7 @@ class NonNavController
     private const FRONT_ANGLE = 90;
 
     /** dirtype 方向匹配容差（度），与 Location::DIR_MATCH_ANGLE 一致 */
-    private const DIR_MATCH_ANGLE = 30;
+    private const DIR_MATCH_ANGLE = 40;
 
     /** 横向走廊最小宽度（米），近距离用于抑制相邻/并行道路 */
     private const CORRIDOR_BASE = 30;

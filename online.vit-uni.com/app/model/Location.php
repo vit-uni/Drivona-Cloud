@@ -19,6 +19,17 @@ class Location
     const MAX_CROSS_TRACK_DISTANCE = 20;
     // 最大横向距离常量：摄像头偏离车辆行驶轨迹的最大允许距离（米）
 
+    const SPEED_LIMIT_LATERAL_BUFFER = 35;
+    // 限速路段横向偏移容差（米）：仅用于「已进入路段」（state=1）。
+    // 车辆已在路段上，横向偏移来自直线段近似曲线道路，需给足余量（1786277 入口点 lateral=18.8m）。
+
+    const SPEED_LIMIT_LATERAL_MIN = 12;
+    // 接近阶段（state=0）横向偏移下限（米）：近距离时的最小横向容忍度，剔除旁边道路/对向车道。
+
+    const SPEED_LIMIT_APPROACH_ANGLE = 10;
+    // 接近阶段（state=0）横向偏移角度容差（度）：atan2(|lateral|, |along|) 超过该角度
+    // 即视为「从侧面接近」而剔除；角偏差本身与距离无关，故用角度而非固定米数。
+
     const EARTH_RADIUS = 6371000.0;
     // 地球半径常量：用于地理距离计算（米）
 
@@ -505,6 +516,84 @@ class Location
     }
 
     /**
+     * 预计算路线段元数据（仅 speedLimit 路径使用）
+     * 一次性计算每段的起终点、长度与方位角，避免对每个候选路段重复 haversine/getBearingFast。
+     *
+     * @param array $route 路线点数组 [['latitude'=>..,'longitude'=>..], ...]
+     * @return array [['slat','slng','elat','elng','len','bearing'], ...]
+     */
+    private static function buildRouteSegments($route): array
+    {
+        $segments = [];
+        $count = count($route);
+        for ($i = 0; $i < $count - 1; $i++) {
+            $sLat = (float) $route[$i]['latitude'];
+            $sLng = (float) $route[$i]['longitude'];
+            $eLat = (float) $route[$i + 1]['latitude'];
+            $eLng = (float) $route[$i + 1]['longitude'];
+            $segments[] = [
+                'slat'    => $sLat,
+                'slng'    => $sLng,
+                'elat'    => $eLat,
+                'elng'    => $eLng,
+                'len'     => self::haversineDistance($sLat, $sLng, $eLat, $eLng),
+                'bearing' => self::getBearingFast($sLat, $sLng, $eLat, $eLng),
+            ];
+        }
+        return $segments;
+    }
+
+    /**
+     * 点到线段最短距离（复用 buildRouteSegments 预计算的段长度与方位角）
+     * 与 getDistanceToSegment 等价，但省去每段重复的 haversine(A,B) 与 getBearingFast(A,B)。
+     */
+    private static function distanceToSegmentFast($px, $py, $seg): float
+    {
+        $px = (float) $px;
+        $py = (float) $py;
+
+        if ($seg['len'] < 3) {
+            return self::haversineDistance($px, $py, $seg['slat'], $seg['slng']);
+        }
+
+        $dAP = self::haversineDistance($seg['slat'], $seg['slng'], $px, $py);
+        $dBP = self::haversineDistance($seg['elat'], $seg['elng'], $px, $py);
+
+        if ($dAP <= $seg['len'] && $dBP <= $seg['len']) {
+            $bearingAP = self::getBearingFast($seg['slat'], $seg['slng'], $px, $py);
+            return abs(asin(sin($dAP / self::EARTH_RADIUS) * sin(deg2rad($bearingAP - $seg['bearing']))) * self::EARTH_RADIUS);
+        }
+
+        return min($dAP, $dBP);
+    }
+
+    /**
+     * 查找最近路线段（复用 buildRouteSegments 预计算结果）
+     * 返回结构与 findNearestSegment 一致：['index','distance','bearing','start','end']
+     */
+    private static function findNearestSegmentFast($pointLat, $pointLng, $segments): ?array
+    {
+        $minDistance = PHP_FLOAT_MAX;
+        $nearest = null;
+
+        foreach ($segments as $i => $seg) {
+            $dist = self::distanceToSegmentFast($pointLat, $pointLng, $seg);
+            if ($dist < $minDistance) {
+                $minDistance = $dist;
+                $nearest = [
+                    'index'    => $i,
+                    'distance' => $dist,
+                    'bearing'  => $seg['bearing'],
+                    'start'    => ['latitude' => $seg['slat'], 'longitude' => $seg['slng']],
+                    'end'      => ['latitude' => $seg['elat'], 'longitude' => $seg['elng']],
+                ];
+            }
+        }
+
+        return $nearest;
+    }
+
+    /**
      * 计算点到线段的投影位置
      * 返回投影点坐标、沿线段起点的偏移距离、是否在线段内
      *
@@ -631,6 +720,418 @@ class Location
         $distance += $cOffset;
 
         return $distance;
+    }
+
+    /**
+     * 解析限速路段相对「行驶方向」的适用限速值
+     *
+     * 路段正向 = 起点(start) → 终点(end)；travel_direction: F=仅正向, T=仅反向, B=双向, N=封闭。
+     * 正向取 from_speed_limit_kmh，反向取 to_speed_limit_kmh。
+     *
+     * @param float $travelBearing 行驶方向（车辆航向，或路线段方位角）
+     * @param array $limit         限速路段记录
+     * @return array|null ['speed_limit'=>int, 'direction'=>'F'|'T', 'seg_bearing'=>int] 或 null（不匹配）
+     */
+    private static function resolveSpeedLimitDirection($travelBearing, $limit)
+    {
+        $travelDirection = $limit['travel_direction'] ?? null;
+        if ($travelDirection === null || $travelDirection === '' || $travelDirection === 'N') {
+            return null; // 封闭/缺失，不匹配
+        }
+
+        $startLat = (float) ($limit['start_lat'] ?? 0);
+        $startLng = (float) ($limit['start_lon'] ?? 0);
+        $endLat   = (float) ($limit['end_lat'] ?? 0);
+        $endLng   = (float) ($limit['end_lon'] ?? 0);
+
+        // 路段几何方位角（起点 → 终点）
+        $segBearing = self::getBearingFast($startLat, $startLng, $endLat, $endLng);
+        $dForward = self::getAngleDiff($travelBearing, $segBearing);
+        $dReverse = self::getAngleDiff($travelBearing, self::normalizeBearing($segBearing + 180));
+        $isForward = $dForward <= $dReverse;
+        $diff = $isForward ? $dForward : $dReverse;
+
+        if ($isForward) {
+            if (!in_array($travelDirection, ['F', 'B'], true)) {
+                return null;
+            }
+            $speedLimit = $limit['from_speed_limit_kmh'] ?? null;
+            $dirCode = 'F';
+        } else {
+            if (!in_array($travelDirection, ['T', 'B'], true)) {
+                return null;
+            }
+            $speedLimit = $limit['to_speed_limit_kmh'] ?? null;
+            $dirCode = 'T';
+        }
+
+        if ($speedLimit === null || $speedLimit === '') {
+            return null; // 该方向无限速（999 已置 NULL）
+        }
+        if ($diff > self::DIR_MATCH_ANGLE) {
+            return null; // 行驶方向与路段方向偏差过大（>30°）
+        }
+
+        return [
+            'speed_limit' => (int) $speedLimit,
+            'direction'   => $dirCode,
+            'seg_bearing' => (int) round($segBearing),
+        ];
+    }
+
+    /**
+     * 计算车辆相对限速路段（entry→exit，已按行驶方向定向）的三段式位置
+     *
+     * along 为车辆在 entry→exit 方向上的有符号投影距离：
+     *   along < 0            → 未进入（entry 在前方）
+     *   0 <= along <= 路段长 → 路段中
+     *   along > 路段长       → 已通过
+     *
+     * @return array ['state'=>0未进入|1路段中|2已通过, 'along'=>float, 'lateral'=>float, 'seg_len'=>float]
+     */
+    private static function classifySpeedLimitPosition($vLat, $vLng, $aLat, $aLng, $bLat, $bLng)
+    {
+        $aLat = (float) $aLat;
+        $aLng = (float) $aLng;
+        $bLat = (float) $bLat;
+        $bLng = (float) $bLng;
+
+        $segLen = self::haversineDistance($aLat, $aLng, $bLat, $bLng);
+        $dA     = self::haversineDistance($vLat, $vLng, $aLat, $aLng);
+
+        if ($segLen < 0.001) {
+            // 起终点几乎重合：视为未进入，距离为到该点距离
+            return ['state' => 0, 'along' => 0.0, 'lateral' => $dA, 'seg_len' => 0.0];
+        }
+
+        $bearingAB = self::getBearingFast($aLat, $aLng, $bLat, $bLng);
+        $bearingAV = self::getBearingFast($aLat, $aLng, $vLat, $vLng);
+
+        // 有符号最短夹角 [-180, 180]
+        $delta = $bearingAV - $bearingAB;
+        if ($delta > 180) {
+            $delta -= 360;
+        } elseif ($delta < -180) {
+            $delta += 360;
+        }
+
+        $along   = $dA * cos(deg2rad($delta));   // 沿 entry→exit 的有符号投影距离
+        $lateral = $dA * sin(deg2rad($delta));   // 有符号横向偏移
+
+        if ($along < 0) {
+            $state = 0; // 未进入：entry 在前方
+        } elseif ($along <= $segLen) {
+            $state = 1; // 路段中
+        } else {
+            $state = 2; // 已通过
+        }
+
+        return [
+            'state'   => $state,
+            'along'   => $along,
+            'lateral' => $lateral,
+            'seg_len' => $segLen,
+        ];
+    }
+
+    /**
+     * 方向解析 + 三段式位置组装（供有/无路线两个分支复用）
+     *
+     * 方向匹配（含对面车道剔除）由 resolveSpeedLimitDirection 保证；
+     * 这里再按行驶方向把路段定向为 entry（车辆先到达的一端）→ exit（后到达的一端）。
+     *
+     * @param float $travelBearing 行驶方向（车辆航向，或路线段方位角）
+     * @param array $limit         限速路段记录
+     * @return array|null 命中返回组装后的结果，否则 null
+     */
+    private static function resolveSpeedLimitSegment($travelBearing, $vLat, $vLng, $limit)
+    {
+        $resolved = self::resolveSpeedLimitDirection($travelBearing, $limit); // 对面车道在此被剔除
+        if ($resolved === null) {
+            return null;
+        }
+
+        $startLat = (float) ($limit['start_lat'] ?? 0);
+        $startLng = (float) ($limit['start_lon'] ?? 0);
+        $endLat   = (float) ($limit['end_lat'] ?? 0);
+        $endLng   = (float) ($limit['end_lon'] ?? 0);
+
+        if ($resolved['direction'] === 'F') {
+            // 正向：entry=起点, exit=终点
+            $entry = ['lat' => $startLat, 'lng' => $startLng];
+            $exit  = ['lat' => $endLat,   'lng' => $endLng];
+        } else {
+            // 反向：entry=终点, exit=起点
+            $entry = ['lat' => $endLat,   'lng' => $endLng];
+            $exit  = ['lat' => $startLat, 'lng' => $startLng];
+        }
+
+        $pos = self::classifySpeedLimitPosition(
+            $vLat, $vLng,
+            $entry['lat'], $entry['lng'],
+            $exit['lat'],  $exit['lng']
+        );
+
+        return $resolved + [
+            'entry_lat' => $entry['lat'],
+            'entry_lng' => $entry['lng'],
+            'exit_lat'  => $exit['lat'],
+            'exit_lng'  => $exit['lng'],
+            'state'     => $pos['state'],
+            'along'     => $pos['along'],
+            'lateral'   => $pos['lateral'],
+            'seg_len'   => $pos['seg_len'],
+        ];
+    }
+
+    /**
+     * 道路限速过滤（无路线）：仅保留车辆前方且行驶方向匹配的限速路段
+     */
+    public static function filterSpeedLimitsInFront($vehicle, $limits, $maxDistance = null)
+    {
+        if (empty($limits)) {
+            return ['result' => [], 'no' => []];
+        }
+
+        $vLat     = (float) $vehicle['lat'];
+        $vLng     = (float) $vehicle['lng'];
+        $vBearing = self::normalizeBearing($vehicle['bearing']);
+
+        $result = [];
+        $no = [];
+        foreach ($limits as $limit) {
+            $matched = self::matchSpeedLimit($vLat, $vLng, $vBearing, $limit, $maxDistance);
+            if ($matched !== null) {
+                $result[] = $matched;
+            } else {
+                $no[] = $limit;
+            }
+        }
+
+        // 排序：路段中(in_segment=1)优先，其余按 distance 由近到远，最后用 id 唯一键兜底保证确定性
+        usort($result, static function ($a, $b) {
+            $inA = (int) ($a['in_segment'] ?? 0);
+            $inB = (int) ($b['in_segment'] ?? 0);
+            if ($inA !== $inB) {
+                return $inB <=> $inA;
+            }
+            $distA = isset($a['distance']) ? (int) round($a['distance']) : PHP_INT_MAX;
+            $distB = isset($b['distance']) ? (int) round($b['distance']) : PHP_INT_MAX;
+            if ($distA !== $distB) {
+                return $distA <=> $distB;
+            }
+            return ((int) ($a['id'] ?? 0)) <=> ((int) ($b['id'] ?? 0));
+        });
+
+        return ['result' => $result, 'no' => $no];
+    }
+
+    /**
+     * 限速路段横向偏移容差（米），随位置状态自适应。
+     *
+     * state=1（路段中）：固定 SPEED_LIMIT_LATERAL_BUFFER —— 车辆已在路上，容曲线近似误差。
+     * state=0（接近中）：max(MIN, |along|·tan(角度容差)) —— 越远越宽、越近越紧，
+     *   既容忍远距离弯道的直线近似误差，又能在近距离剔除从侧面接近的旁路。
+     */
+    private static function speedLimitLateralLimit($state, $along)
+    {
+        if ($state === 1) {
+            return self::SPEED_LIMIT_LATERAL_BUFFER;
+        }
+        return max(self::SPEED_LIMIT_LATERAL_MIN, abs($along) * tan(deg2rad(self::SPEED_LIMIT_APPROACH_ANGLE)));
+    }
+
+    /**
+     * 单个限速路段匹配（无路线）：方向 + 三段式位置 + 横向容差
+     *
+     * state=0 未进入 → distance 为到起点(entry)距离
+     * state=1 路段中 → distance 为到终点(exit)距离
+     * state=2 已通过 → 不返回
+     */
+    private static function matchSpeedLimit($vLat, $vLng, $vBearing, $limit, $maxDistance)
+    {
+        $base = self::resolveSpeedLimitSegment($vBearing, $vLat, $vLng, $limit);
+        if ($base === null) {
+            return null; // 方向不匹配（含对面车道）
+        }
+
+        if ($base['state'] === 2) {
+            return null; // 已通过该路段
+        }
+
+        if (abs($base['lateral']) > self::speedLimitLateralLimit($base['state'], $base['along'])) {
+            return null; // 横向偏移超出自适应容差，不在该路段上
+        }
+
+        if ($base['state'] === 0) {
+            // 未进入：距离限速起始点
+            $targetLat = $base['entry_lat'];
+            $targetLng = $base['entry_lng'];
+        } else {
+            // 路段中：距离限速终点
+            $targetLat = $base['exit_lat'];
+            $targetLng = $base['exit_lng'];
+        }
+
+        $distance = self::haversineDistance($vLat, $vLng, $targetLat, $targetLng);
+        if ($maxDistance !== null && $distance > $maxDistance) {
+            return null;
+        }
+
+        $limit['distance']        = (int) round($distance);
+        $limit['in_segment']      = $base['state'] === 1 ? 1 : 0;
+        $limit['speed_limit']     = $base['speed_limit'];
+        $limit['direction']       = $base['direction'];
+        $limit['seg_bearing']     = $base['seg_bearing'];
+        $limit['match_latitude']  = $targetLat;
+        $limit['match_longitude'] = $targetLng;
+
+        unset($limit['nearest_distance'], $limit['start_distance'], $limit['end_distance']);
+
+        return $limit;
+    }
+
+    /**
+     * 道路限速过滤（有路线）：按导航路线（缓冲区 + 沿路线距离 + 行驶方向）过滤
+     */
+    public static function filterSpeedLimitsBySide($vehicle, $limits, $route, $maxDistance = null, $routeBuffer = 20)
+    {
+        if (empty($limits) || empty($route) || count($route) < 2) {
+            return self::filterSpeedLimitsInFront($vehicle, $limits, $maxDistance);
+        }
+
+        $vLat = (float) $vehicle['lat'];
+        $vLng = (float) $vehicle['lng'];
+
+        // 预计算路线段元数据，供后续候选路段复用，避免重复 haversine/方位角计算
+        $segs = self::buildRouteSegments($route);
+
+        $vehicleRoutePos = null;
+        $vNearestSeg = self::findNearestSegmentFast($vLat, $vLng, $segs);
+        if ($vNearestSeg !== null) {
+            $vProjection = self::getPointToSegmentProjection(
+                $vLat, $vLng,
+                $vNearestSeg['start']['latitude'], $vNearestSeg['start']['longitude'],
+                $vNearestSeg['end']['latitude'],   $vNearestSeg['end']['longitude']
+            );
+            $vehicleRoutePos = [
+                'segment_index' => $vNearestSeg['index'],
+                'offset'        => $vProjection['offset']
+            ];
+        }
+
+        $result = [];
+        $no = [];
+        foreach ($limits as $limit) {
+            $matched = self::matchSpeedLimitBySide($vLat, $vLng, $limit, $route, $segs, $maxDistance, $routeBuffer, $vehicleRoutePos);
+            if (!empty($matched['code'])) {
+                $result[] = $matched['limit'];
+            } else {
+                $no[] = ['result' => $matched, 'limit' => $limit];
+            }
+        }
+
+        // 排序：路段中(in_segment=1)优先，其余按 distance 由近到远，最后用 id 唯一键兜底保证确定性
+        usort($result, static function ($a, $b) {
+            $inA = (int) ($a['in_segment'] ?? 0);
+            $inB = (int) ($b['in_segment'] ?? 0);
+            if ($inA !== $inB) {
+                return $inB <=> $inA;
+            }
+            $distA = isset($a['distance']) ? (int) round($a['distance']) : PHP_INT_MAX;
+            $distB = isset($b['distance']) ? (int) round($b['distance']) : PHP_INT_MAX;
+            if ($distA !== $distB) {
+                return $distA <=> $distB;
+            }
+            return ((int) ($a['id'] ?? 0)) <=> ((int) ($b['id'] ?? 0));
+        });
+
+        return ['result' => $result, 'no' => $no];
+    }
+
+    /**
+     * 单个限速路段匹配（有路线）
+     */
+    private static function matchSpeedLimitBySide($vLat, $vLng, $limit, $route, $segs, $maxDistance, $routeBuffer, $vehicleRoutePos)
+    {
+        $startLat = (float) ($limit['start_lat'] ?? 0);
+        $startLng = (float) ($limit['start_lon'] ?? 0);
+
+        $nearestSegment = self::findNearestSegmentFast($startLat, $startLng, $segs);
+        if ($nearestSegment === null) {
+            return ['code' => 0, 'reason' => '路线数据异常'];
+        }
+
+        $distToRoute = $nearestSegment['distance'];
+        if ($distToRoute > $routeBuffer) {
+            return ['code' => 0, 'reason' => '超过路线缓冲区'];
+        }
+
+        // 方向匹配使用「路段起点最近路线段方位角」，并完成三段式位置判定
+        $base = self::resolveSpeedLimitSegment($nearestSegment['bearing'], $vLat, $vLng, $limit);
+        if ($base === null) {
+            return ['code' => 0, 'reason' => '不在同方向'];
+        }
+
+        if ($base['state'] === 2) {
+            return ['code' => 0, 'reason' => '已通过该路段'];
+        }
+
+        // 车辆相对限速路段直线的横向偏移校验（剔除旁边道路 / 对向车道）
+        if (abs($base['lateral']) > self::speedLimitLateralLimit($base['state'], $base['along'])) {
+            return ['code' => 0, 'reason' => '横向偏移超限'];
+        }
+
+        if ($base['state'] === 0) {
+            // 未进入：目标点为起点(entry)
+            $targetLat = $base['entry_lat'];
+            $targetLng = $base['entry_lng'];
+        } else {
+            // 路段中：目标点为终点(exit)
+            $targetLat = $base['exit_lat'];
+            $targetLng = $base['exit_lng'];
+        }
+
+        $directDistance = self::haversineDistance($vLat, $vLng, $targetLat, $targetLng);
+        $distance       = $directDistance;
+
+        if ($vehicleRoutePos !== null) {
+            $targetSegment = self::findNearestSegmentFast($targetLat, $targetLng, $segs);
+            if ($targetSegment === null) {
+                return ['code' => 0, 'reason' => '路线数据异常'];
+            }
+            $tProjection = self::getPointToSegmentProjection(
+                $targetLat, $targetLng,
+                $targetSegment['start']['latitude'], $targetSegment['start']['longitude'],
+                $targetSegment['end']['latitude'],   $targetSegment['end']['longitude']
+            );
+            $targetRoutePos = [
+                'segment_index' => $targetSegment['index'],
+                'offset'        => $tProjection['offset']
+            ];
+            $navDistance = self::getRouteDistance($vehicleRoutePos, $targetRoutePos, $route);
+            if ($navDistance > 0) {
+                $distance = $navDistance; // 沿路导航距离
+            }
+        }
+
+        if ($maxDistance !== null && $distance > $maxDistance) {
+            return ['code' => 0, 'reason' => 'exceed_max_distance'];
+        }
+
+        $limit['distance']          = (int) round($distance);
+        $limit['direct_distance']   = (int) round($directDistance);
+        $limit['in_segment']        = $base['state'] === 1 ? 1 : 0;
+        $limit['speed_limit']       = $base['speed_limit'];
+        $limit['direction']         = $base['direction'];
+        $limit['seg_bearing']       = $base['seg_bearing'];
+        $limit['match_latitude']    = $targetLat;
+        $limit['match_longitude']   = $targetLng;
+        $limit['distance_to_route'] = (int) round($distToRoute);
+
+        unset($limit['nearest_distance'], $limit['start_distance'], $limit['end_distance']);
+
+        return ['code' => 1, 'limit' => $limit];
     }
 
 }

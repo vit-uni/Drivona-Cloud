@@ -655,8 +655,135 @@ class IndexController
         
         //$return = Location::filterCamerasInFront($vehicle, $list, $maxDistance);
         return json(['code' => 1, 'msg' => self::t($request, '成功'), 'data' => $return['result']??[]]);
-    }   
-    
+    }
+
+
+    /**
+     * 获取道路限速列表
+     * 根据用户位置、方向，返回前方指定距离内且行驶方向匹配的限速路段
+     * 数据表 wa_speed_limit（Db::name() 自动加 wa_ 前缀），坐标过滤走 (start_lat, start_lon) 联合索引
+     */
+    public function speedLimit(Request $request){
+        $startTime = microtime(true);
+        // 1. 输入参数获取与类型转换（float 转换防 SQL 注入）
+        $lat = (float) $request->input('lat');
+        $long = (float) $request->input('long');
+        $direction = (float) $request->input('direction', 0);
+        $route = $request->input('route');
+        // 2. 参数合法性校验
+        if ($lat < -90 || $lat > 90 || $long < -180 || $long > 180) {
+            return json(['code' => 0, 'msg' => self::t($request, '经纬度参数无效')]);
+        }
+        $maxDistance = 2000;
+        $candidateLimit = 3000; // 候选安全上限：单次查询框内的路段全部返回，防止极端稠密区域撑爆内存/CPU
+
+        // 3. 路线参数提前解码：带路线时用「路线包围盒」缩小 SQL 查询范围
+        if ($route && !is_array($route)) {
+            $route = json_decode($route, true);
+        }
+        if (!is_array($route) || count($route) < 2) {
+            $route = null;
+        }
+
+        Log::info('ipspeedlimit:'.$request->getRealIp().'/'.$lat.'/'.$long.'/'.$direction.'/'.$maxDistance);
+
+        // 1 度纬度 ≈ 111320 米；1 度经度 ≈ 111320 × cos(纬度) 米
+        $metersPerDegLat = 111320.0;
+        $metersPerDegLng = max(111320.0 * cos(deg2rad($lat)), 0.001);
+
+        // 4. 数据库查询：取「车辆为中心、半径 maxDistance×1.2」包围盒内的候选，按端点平面距离粗排，最终由 PHP 端精确 haversine 重排。
+        //    坐标范围一律走 (start_lat, start_lon) 联合索引的双边 BETWEEN。
+        //    ⚠ 不可再用「800→2400→8000 渐进扩圈 + LIMIT 300 截断」：城区单个 2.4km 框内可达近千条路段，
+        //    按端点距离排序时「刚驶入的远端路段」会被挤出前 300 条而漏报（实测 2085518 在 1543m 处排名约第 329 位被截断 → 返回0条）。
+        //    半径 maxDistance×1.2 的包围盒已完整覆盖 maxDistance 搜索圆盘（留 20% 余量抵消平面距离与 haversine 的误差），故一次取全量。
+        $tQuery = microtime(true);
+        $newQuery = function () use ($lat, $long, $metersPerDegLng, $candidateLimit) {
+            return Db::name('speed_limit')
+                ->field("id, link_id, source, country_code, travel_direction,
+                         from_speed_limit_kmh, to_speed_limit_kmh, speed_limit_source_desc, unit,
+                         start_lon, start_lat, end_lon, end_lat")
+                ->order(Db::raw("LEAST(
+                    POW((start_lat - {$lat}) * 111320.0, 2) + POW((start_lon - {$long}) * {$metersPerDegLng}, 2),
+                    POW((end_lat - {$lat}) * 111320.0, 2) + POW((end_lon - {$long}) * {$metersPerDegLng}, 2)
+                ) ASC, id ASC"))
+                ->limit($candidateLimit);
+        };
+
+        // 路线包围盒：只作为候选的「路线相关性」粗筛。
+        // 缓冲取 0.001°(≈111m)：路线过滤（matchSpeedLimitBySide）要求路段起点距路线 ≤20m，
+        // 111m 已留 5 倍余量。原实现的 0.01°(≈1.1km) 会让查询框膨胀数倍（SQL 变慢），
+        // 且 300 条候选容易被路线外路段挤占，反而可能漏掉路线上的限速。
+        $routeBox = null;
+        if ($route !== null) {
+            $minLat = $maxLat = null;
+            $minLon = $maxLon = null;
+            foreach ($route as $p) {
+                if (!isset($p['latitude'], $p['longitude'])) {
+                    continue;
+                }
+                $pLat = (float) $p['latitude'];
+                $pLng = (float) $p['longitude'];
+                $minLat = $minLat === null ? $pLat : min($minLat, $pLat);
+                $maxLat = $maxLat === null ? $pLat : max($maxLat, $pLat);
+                $minLon = $minLon === null ? $pLng : min($minLon, $pLng);
+                $maxLon = $maxLon === null ? $pLng : max($maxLon, $pLng);
+            }
+            if ($minLat !== null) {
+                $bufLat = 0.001;
+                $bufLon = $bufLat / max(cos(deg2rad($lat)), 0.001);
+                // 同时裁剪到车辆 maxDistance 窗口：整条导航路线可能远超 30km，超出部分不可能是候选
+                $winLat = ($maxDistance * 1.2) / $metersPerDegLat;
+                $winLon = ($maxDistance * 1.2) / $metersPerDegLng;
+                $routeBox = [
+                    max($minLat - $bufLat, $lat - $winLat), min($maxLat + $bufLat, $lat + $winLat),
+                    max($minLon - $bufLon, $long - $winLon), min($maxLon + $bufLon, $long + $winLon),
+                ];
+            }
+            if ($routeBox === null || $routeBox[0] > $routeBox[1] || $routeBox[2] > $routeBox[3]) {
+                $route = null; // 路线点无有效坐标 / 与车辆无关，退化为无路线分支
+                $routeBox = null;
+            }
+        }
+
+        // 5. 候选查询框：车辆为中心、半径 maxDistance×1.2 的包围盒；带路线时再与路线包围盒求交集（只保留路线附近候选）。
+        $radius = (int) ($maxDistance * 1.2);
+        $latRadius = $radius / $metersPerDegLat;
+        $lngRadius = $radius / $metersPerDegLng;
+        $box = [$lat - $latRadius, $lat + $latRadius, $long - $lngRadius, $long + $lngRadius];
+        if ($routeBox !== null) {
+            $box = [
+                max($box[0], $routeBox[0]), min($box[1], $routeBox[1]),
+                max($box[2], $routeBox[2]), min($box[3], $routeBox[3]),
+            ];
+        }
+        $list = [];
+        // 交集为空（路线与车辆搜索框完全不相交）时无候选，直接跳过查询
+        if ($box[0] <= $box[1] && $box[2] <= $box[3]) {
+            $list = $newQuery()
+                ->where("start_lat BETWEEN ? AND ?", [$box[0], $box[1]])
+                ->where("start_lon BETWEEN ? AND ?", [$box[2], $box[3]])
+                ->select();
+        }
+        $queryRadius = $radius;
+        $queryMs = round((microtime(true) - $tQuery) * 1000, 2);
+
+        // 6. 行驶方向 + 前方 + 路线过滤
+        $tFilter = microtime(true);
+        $vehicle = ['lat' => $lat, 'lng' => $long, 'bearing' => $direction];
+
+        if($route){
+            $return = Location::filterSpeedLimitsBySide($vehicle, $list, $route, $maxDistance);
+        }else{
+            $return = Location::filterSpeedLimitsInFront($vehicle, $list, $maxDistance);
+        }
+        $filterMs = round((microtime(true) - $tFilter) * 1000, 2);
+
+        $totalMs = round((microtime(true) - $startTime) * 1000, 2);
+        Log::info('ipspeedlimit耗时: totalMs='.$totalMs.', queryMs='.$queryMs.', filterMs='.$filterMs.', candidates='.count($list).', radius='.($queryRadius ?? 'route').', 返回'.count($return['result'] ?? []).'条');
+
+        return json(['code' => 1, 'msg' => self::t($request, '成功'), 'data' => $return['result'] ?? []]);
+
+    }
     
     
     
